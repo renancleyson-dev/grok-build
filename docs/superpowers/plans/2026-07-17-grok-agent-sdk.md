@@ -6,7 +6,7 @@
 
 **Architecture:** A child process (`grok agent stdio`) is driven through `@agentclientprotocol/sdk`'s `client({name}).onRequest(...).connectWith(stream, ctx => ...)` builder. Inside that callback, `ctx.buildSession(cwd).withSession(session => ...)` drives one ACP session; `session.prompt()`/`session.nextUpdate()` are translated into a typed `SDKMessage` stream and pushed into an internal async queue that the public `query()` async generator reads from — this decouples the ACP session's own callback-scoped lifetime from the caller-facing async-iterable API. `canUseTool` is wired to the ACP `session/request_permission` handler (the only point in the protocol that can block a tool call). Hooks (`PreToolUse`/`PostToolUse`) tap the same message stream for observation. Custom tools run a real `@modelcontextprotocol/sdk` `McpServer` in the SDK's own process, exposed over a loopback-only, bearer-token-protected HTTP transport, and registered with the session via `SessionBuilder.withMcpServer()`. Both `@agentclientprotocol/sdk`'s core and `@modelcontextprotocol/sdk`'s `WebStandardStreamableHTTPServerTransport` are Web-Standard-based and runtime-agnostic by construction; the package isolates the two genuinely runtime-specific concerns — spawning the `grok` subprocess (Task 3) and hosting the loopback MCP server's HTTP listener (Task 11) — behind small, explicit seams rather than letting runtime assumptions leak into the rest of the code.
 
-**Tech Stack:** TypeScript (Node >=20, ESM; also runs on Bun, verified against Bun 1.3.14 — see Task 3), `@agentclientprotocol/sdk@^1.2.1`, `@modelcontextprotocol/sdk@^1.29.0`, `zod@^3.25.76`, `vitest@^3`, `pnpm@10.12.4`.
+**Tech Stack:** TypeScript (Node >=22, ESM-only; also runs on Bun, verified against Bun 1.3.14 — see Task 3), `@agentclientprotocol/sdk@^1.2.1`, `@modelcontextprotocol/sdk@^1.29.0`, `zod@^4.0.0`, `vitest@^4`, `pnpm@10.34.5`. Build: plain `tsc` (no bundler — see Global Constraints). Lint/format: Biome (single tool, replaces ESLint+Prettier). Package correctness: `publint` + `@arethetypeswrong/cli`, run in Task 15 once the real public API surface exists.
 
 ## Global Constraints
 
@@ -19,6 +19,7 @@
 - Git: commit after each task, local repo only (no remote push in this plan).
 - Scope trim from the spec, stated explicitly rather than silently dropped: `permissionMode` ships with only `"default"`/`"bypassPermissions"` in v1 (not `"acceptEdits"`/`"plan"`), and `maxTurns` is not implemented — ACP does not expose a client-visible per-turn round counter equivalent to headless mode's `num_turns` without deeper protocol-level accounting, so it needs its own design pass rather than a guessed implementation. Both are v1.1 follow-ups; do not silently invent semantics for them in this plan.
 - Further scope trim from this turn's runtime-agnostic pass: Bun/Deno support covers only the core `query()` path (Task 3's subprocess spawn). The loopback MCP server (Task 11) still hosts exclusively via `node:http`; swapping in `Bun.serve()`/`Deno.serve()` for that listener (removing even the small Node bridge) is a natural v1.1 follow-up, not done here, since custom tools are a less central path than `query()` itself.
+- Boilerplate/tooling pass (this turn), versions and choices verified against the live npm registry rather than assumed, since AI-suggested boilerplate frequently drifts stale: Node floor raised `>=20` → `>=22` because Node 20 reached end-of-life 2026-04-30 (Node 22 is current Maintenance LTS, Node 24 is Active LTS). `typescript` bumped to `^7.0.0` (the native Go-ported compiler, GA'd 2026-07-08) — safe here because this package only drives `tsc` as a CLI (build + typecheck), and TS7's one documented GA gap is the *programmatic* Compiler API (deferred to 7.1), which this plan never touches. `zod` bumped to `^4.0.0` (peer-compatible with both `@agentclientprotocol/sdk@1.2.1` and `@modelcontextprotocol/sdk@1.29.0`, which both accept `^3.25 || ^4.0`) — this forced real fixes in Task 10/11 because zod v4 removed `ZodRawShape` and `objectOutputType` from its default export (they now only exist under the legacy `zod/v3` subpath); Task 10 now constrains on `Record<string, z.ZodType>` and infers handler args with a mapped type instead, both verified against the real `zod@4.4.3` package `.d.ts`. No bundler (tsup/tsdown/unbuild) was added: this is an ESM-only library with no dual CJS/ESM requirement, so a bundler's main value-add doesn't apply, and `tsdown` specifically requires Node `^22.18.0 || >=24.11.0` to run, which would immediately break on this machine's installed Node (22.17.0) — plain `tsc` avoids that floor entirely and keeps the devDependency count minimal, consistent with this SDK's own minimum-dependency goal. Lint/format is Biome (`@biomejs/biome`) instead of ESLint+Prettier — one dependency instead of several, and it's the standard consolidation move as of 2026. `publint` and `@arethetypeswrong/cli` are added as devDependencies in Task 1 (so `pnpm pack:check` exists from the start) but are only meaningfully run once Task 15 builds the real public API surface — running them against Task 1's placeholder export would validate nothing.
 
 ---
 
@@ -29,6 +30,9 @@
 - Create: `~/Documents/Workfolder/grok-agent-sdk/tsconfig.json`
 - Create: `~/Documents/Workfolder/grok-agent-sdk/vitest.config.ts`
 - Create: `~/Documents/Workfolder/grok-agent-sdk/.gitignore`
+- Create: `~/Documents/Workfolder/grok-agent-sdk/biome.json`
+- Create: `~/Documents/Workfolder/grok-agent-sdk/.npmrc`
+- Create: `~/Documents/Workfolder/grok-agent-sdk/.github/workflows/ci.yml`
 - Create: `~/Documents/Workfolder/grok-agent-sdk/src/index.ts`
 - Test: `~/Documents/Workfolder/grok-agent-sdk/test/smoke.test.ts`
 
@@ -54,7 +58,8 @@ Expected: `Initialized empty Git repository in .../grok-agent-sdk/.git/`
   "description": "Programmatic harness SDK for Grok Build, built on the Agent Client Protocol.",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
+  "packageManager": "pnpm@10.34.5",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -68,30 +73,38 @@ Expected: `Initialized empty Git repository in .../grok-agent-sdk/.git/`
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "pack:check": "publint && attw --pack ."
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.2.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^3.25.76"
+    "zod": "^4.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^7.0.0",
+    "vitest": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "@biomejs/biome": "^2.5.0",
+    "publint": "^0.3.21",
+    "@arethetypeswrong/cli": "^0.18.5"
   }
 }
 ```
+
+Notes on choices, verified against the live npm registry rather than assumed (see Global Constraints for the full reasoning): Node floor `>=22` (Node 20 is EOL as of 2026-04-30); `typescript@^7.0.0` is the current native-compiler major, safe here since this package only drives `tsc` as a CLI; `zod@^4.0.0` is peer-compatible with both SDK dependencies; no bundler dependency (`tsup`/`tsdown`/`unbuild`) — this is an ESM-only library, so a bundler's dual-format value-add doesn't apply, and `tsdown` specifically would require Node `^22.18.0` to even run.
 
 - [ ] **Step 3: Write `tsconfig.json`**
 
 ```json
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2023",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
+    "lib": ["ES2023"],
     "outDir": "dist",
     "rootDir": "src",
     "declaration": true,
@@ -125,13 +138,69 @@ dist/
 *.tsbuildinfo
 ```
 
-- [ ] **Step 6: Write a placeholder `src/index.ts`**
+- [ ] **Step 6: Write `biome.json`**
+
+Biome replaces ESLint+Prettier with one Rust-based tool — one devDependency instead of several, no config conflicts between a linter and a formatter.
+
+```json
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.4/schema.json",
+  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
+  "files": { "ignoreUnknown": false },
+  "formatter": { "enabled": true, "indentStyle": "space" },
+  "linter": { "enabled": true, "rules": { "recommended": true } },
+  "javascript": { "formatter": { "quoteStyle": "double" } }
+}
+```
+
+`quoteStyle: "double"` matches the double-quote convention every later task's code already uses.
+
+- [ ] **Step 7: Write `.npmrc`**
+
+```
+engine-strict=true
+```
+
+Makes `pnpm install` refuse to run on a Node version older than the `engines.node` floor in `package.json`, instead of silently succeeding and failing later in some runtime-specific way.
+
+- [ ] **Step 8: Write `.github/workflows/ci.yml`**
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+```
+
+`pnpm/action-setup@v4` reads the pinned version from `package.json`'s `packageManager` field, so the CLI version doesn't need to be repeated here. This file is inert until the repo has a GitHub remote (none is created in this plan — see Global Constraints), but it costs nothing to have in place now.
+
+- [ ] **Step 9: Write a placeholder `src/index.ts`**
 
 ```ts
 export const VERSION = "0.1.0";
 ```
 
-- [ ] **Step 7: Write the smoke test**
+- [ ] **Step 10: Write the smoke test**
 
 ```ts
 import { describe, it, expect } from "vitest";
@@ -144,7 +213,7 @@ describe("package scaffolding", () => {
 });
 ```
 
-- [ ] **Step 8: Install dependencies**
+- [ ] **Step 11: Install dependencies**
 
 ```bash
 cd ~/Documents/Workfolder/grok-agent-sdk
@@ -153,7 +222,7 @@ pnpm install
 
 Expected: lockfile `pnpm-lock.yaml` created, no errors.
 
-- [ ] **Step 9: Run the test suite**
+- [ ] **Step 12: Run the test suite**
 
 ```bash
 pnpm test
@@ -161,7 +230,7 @@ pnpm test
 
 Expected: 1 passed (`package scaffolding > exports a version string`).
 
-- [ ] **Step 10: Run the typechecker**
+- [ ] **Step 13: Run the typechecker**
 
 ```bash
 pnpm typecheck
@@ -169,7 +238,15 @@ pnpm typecheck
 
 Expected: no errors.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 14: Run the linter**
+
+```bash
+pnpm lint
+```
+
+Expected: no errors (Biome's default rule set is clean against the placeholder scaffold).
+
+- [ ] **Step 15: Commit**
 
 ```bash
 git add -A
@@ -1872,13 +1949,13 @@ git commit -m "feat: add PreToolUse/PostToolUse hook dispatch and wire into quer
 **Interfaces:**
 - Produces:
   ```ts
-  export interface ToolDefinition<Args extends z.ZodRawShape> {
+  export interface ToolDefinition<Args extends Record<string, z.ZodType>> {
     name: string;
     description: string;
     inputSchema: Args;
-    handler: (args: z.objectOutputType<Args, z.ZodTypeAny>) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
+    handler: (args: { [K in keyof Args]: z.infer<Args[K]> }) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
   }
-  export function tool<Args extends z.ZodRawShape>(
+  export function tool<Args extends Record<string, z.ZodType>>(
     name: string,
     description: string,
     inputSchema: Args,
@@ -1886,6 +1963,8 @@ git commit -m "feat: add PreToolUse/PostToolUse hook dispatch and wire into quer
   ): ToolDefinition<Args>;
   ```
   Consumed by Task 11's `createSdkMcpServer`.
+
+  `Record<string, z.ZodType>` and the mapped-type inference, not zod v3's `ZodRawShape`/`objectOutputType` — verified against the real `zod@4.4.3` package: zod v4's default export (`import { z } from "zod"`) dropped both names (they now live only under the legacy `zod/v3` subpath). `z.ZodType` and `z.infer` remain in the default export and are the stable, non-version-specific way to express this. This shape is also structurally compatible with what `@modelcontextprotocol/sdk@1.29.0`'s `registerTool` expects (its own `ZodRawShapeCompat` is `Record<string, AnySchema>`), which is why Task 11 can pass `definition.inputSchema` straight through with no cast.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1928,14 +2007,14 @@ export interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
 }
 
-export interface ToolDefinition<Args extends z.ZodRawShape> {
+export interface ToolDefinition<Args extends Record<string, z.ZodType>> {
   name: string;
   description: string;
   inputSchema: Args;
-  handler: (args: z.objectOutputType<Args, z.ZodTypeAny>) => Promise<ToolResult>;
+  handler: (args: { [K in keyof Args]: z.infer<Args[K]> }) => Promise<ToolResult>;
 }
 
-export function tool<Args extends z.ZodRawShape>(
+export function tool<Args extends Record<string, z.ZodType>>(
   name: string,
   description: string,
   inputSchema: Args,
@@ -2049,7 +2128,6 @@ import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { z } from "zod";
 import type { McpServer as AcpMcpServerConfig } from "@agentclientprotocol/sdk";
 import type { ToolDefinition } from "./tool.js";
 
@@ -2105,7 +2183,7 @@ export async function createSdkMcpServer(options: {
   for (const definition of options.tools) {
     mcpServer.registerTool(
       definition.name,
-      { description: definition.description, inputSchema: definition.inputSchema as z.ZodRawShape },
+      { description: definition.description, inputSchema: definition.inputSchema },
       async (args: unknown) => definition.handler(args as never),
     );
   }
@@ -2531,12 +2609,23 @@ session resume. Not yet covered: session fork wired into `query()`, remote
 ```bash
 pnpm test
 pnpm typecheck
+pnpm lint
 pnpm build
 ```
 
-Expected: all tests pass, no type errors, build succeeds.
+Expected: all tests pass, no type errors, no lint errors, build succeeds.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Validate the package is actually publishable**
+
+`publint` and `@arethetypeswrong/cli` were installed in Task 1 but had nothing meaningful to check until now — this is the first point where `dist/` reflects the real public API surface (Task 13's `src/index.ts`) instead of the placeholder `VERSION` export.
+
+```bash
+pnpm pack:check
+```
+
+Expected: `publint` reports no errors (the `exports` map in `package.json` matches what `tsc` actually emitted into `dist/`), and `attw --pack .` reports no "false ESM"/resolution problems for the `node16`/`bundler` resolution modes it checks by default. If either tool reports a real issue, fix the `exports` field or the emitted `dist/` shape (not the checker) before committing.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add README.md examples/basic-query.ts
