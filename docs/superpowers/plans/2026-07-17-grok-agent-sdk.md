@@ -14,7 +14,8 @@
 - Package manager: `pnpm`. Test framework: `vitest`.
 - Every ACP method/type name used in code must be one that exists in `@agentclientprotocol/sdk@1.2.1`'s published `.d.ts` (verified during design: `ndJsonStream`, `client()`/`ClientApp`, `ClientContext.buildSession()`, `SessionBuilder`, `ActiveSession`, `ActiveSessionMessage`, `schema.*` types, `methods.client.session.requestPermission`/`.update`, `methods.agent.session.new`/`.prompt`/`.cancel`/`.fork`). Do not invent method names.
 - Loopback MCP server (Task 11) must bind to `127.0.0.1` only and require a per-run random bearer token — never an open port with no auth, per the spec's stated risk. It must use `WebStandardStreamableHTTPServerTransport`, not the Node-only `StreamableHTTPServerTransport`/`NodeStreamableHTTPServerTransport` wrapper, so the transport itself stays portable even though this plan only implements the `node:http` hosting bridge.
-- Runtime-portability verification status, stated honestly rather than assumed: the Node path (Task 3, Task 11) is exercised by every test in this plan. The Bun path (Task 3) was verified against a real installed Bun 1.3.14 binary during design and has its own passing unit test. The Deno path (Task 3) is written against Deno's stable, documented `Deno.Command` API but was never executed against a real Deno runtime in this environment — its test is gated on `typeof Deno !== "undefined"` and self-verifies only once actually run under `deno test`. Do not upgrade Deno support from "written" to "verified" in documentation or commit messages until that gated test has actually passed.
+- Runtime-portability verification status, stated honestly rather than assumed: the Node path (Task 3, Task 11) is exercised by every test in this plan. The Bun path (Task 3) was verified against a real installed Bun 1.3.14 binary during design and has its own passing unit test. The Deno path (Task 3) is written against Deno's stable, documented `Deno.Command` API and, in a later research pass, Deno 2.9.3 was actually installed in the design environment and driven directly: `Deno.Command({stdin:"piped", stdout:"piped"}).spawn()` was confirmed to produce genuine `WritableStream`/`ReadableStream` instances (not adapter objects, unlike Bun's `stdin`), verified by writing and reading real bytes through them end-to-end. The real `@agentclientprotocol/sdk@1.2.1` and `@modelcontextprotocol/sdk@1.29.0` packages (via `npm:` specifiers) were also imported and exercised under that real Deno runtime — `client`, `McpServer`, and `WebStandardStreamableHTTPServerTransport` all constructed and connected successfully, and `mcpServer.registerTool()` accepted Task 10's `Record<string, z.ZodType>` shape with real `zod@4.4.3`, same as under Node and Bun. This meaningfully de-risks the Deno path beyond "written against documentation," but it is still not the same claim as "this repo's own Task 3 code and its gated test have run and passed" — the repo doesn't exist yet. Do not upgrade Deno support from "API behavior independently verified" to "this package's own tests pass on Deno" in documentation or commit messages until Task 3's gated test has actually been run with `deno test` against the real implementation.
+- Platform-support boundary, discovered during the same research pass and worth stating explicitly so "runtime-agnostic" is never over-read: this SDK's core `query()` path always spawns `grok agent stdio` as a real OS subprocess, so it can only ever run on runtimes with genuine OS process access — Node, Bun, and self-hosted Deno. It cannot run on Deno Deploy or Cloudflare Workers (both isolate/edge sandboxes that categorically forbid subprocess spawning — confirmed for Deno Deploy via Deno's own docs), even though `@modelcontextprotocol/sdk`'s `WebStandardStreamableHTTPServerTransport` docstring lists those platforms as supported runtimes for *that transport in isolation*. That claim is true and irrelevant here: it would only matter if this SDK hosted an MCP/ACP *server* on the edge, which it doesn't — it's a client spawning a local/remote-shelled agent process. Separately, running on Deno requires the consumer to pass `--allow-run` (to spawn `grok`) and `--allow-env` if their own code reads `process.env`/`Deno.env` anywhere in the same script — confirmed directly: `process.cwd()` works under Deno with zero permission flags, but `process.env.X` throws `NotCapable` without `--allow-env`. Node and Bun have no equivalent sandbox and need no such flags. Document both points in Task 15's README rather than leaving a Deno user to debug a `NotCapable` error or a Deno-Deploy subprocess failure and conclude the SDK is broken.
 - No placeholders: every task below has real, complete code. `pnpm test` must pass after every task.
 - Git: commit after each task, local repo only (no remote push in this plan).
 - Scope trim from the spec, stated explicitly rather than silently dropped: `permissionMode` ships with only `"default"`/`"bypassPermissions"` in v1 (not `"acceptEdits"`/`"plan"`), and `maxTurns` is not implemented — ACP does not expose a client-visible per-turn round counter equivalent to headless mode's `num_turns` without deeper protocol-level accounting, so it needs its own design pass rather than a guessed implementation. Both are v1.1 follow-ups; do not silently invent semantics for them in this plan.
@@ -2586,6 +2587,25 @@ for await (const message of q) {
   if (message.type === "text_delta") process.stdout.write(message.text);
 }
 \`\`\`
+
+## Runtime support
+
+Works on Node (>=22), Bun, and self-hosted Deno — anywhere with real OS
+process access. It does **not** work on Deno Deploy or Cloudflare Workers:
+`query()` always spawns \`grok agent stdio\` as a real subprocess, and both
+of those platforms are isolate/edge sandboxes that forbid subprocess
+spawning outright — this is a hard platform limit, not a missing permission.
+
+On Deno specifically (unlike Node/Bun, which have no equivalent sandbox),
+pass at least:
+
+\`\`\`bash
+deno run --allow-run --allow-env your-script.ts
+\`\`\`
+
+\`--allow-run\` lets Deno spawn the \`grok\` binary; \`--allow-env\` is only
+needed if your own code reads \`process.env\`/\`Deno.env\` (\`process.cwd()\`
+itself needs no permission flag).
 
 ## Design
 
