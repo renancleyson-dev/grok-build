@@ -4,19 +4,21 @@
 
 **Goal:** Build `grok-agent-sdk`, a TypeScript package that gives applications programmatic, harness-level control of Grok Build's agent (spawn, stream turns, approve/deny tool calls, register custom tools, resume/fork sessions) — the same role Claude Agent SDK plays for Claude Code — by wrapping `grok agent stdio` (ACP) via `@agentclientprotocol/sdk`.
 
-**Architecture:** A child process (`grok agent stdio`) is driven through `@agentclientprotocol/sdk`'s `client({name}).onRequest(...).connectWith(stream, ctx => ...)` builder. Inside that callback, `ctx.buildSession(cwd).withSession(session => ...)` drives one ACP session; `session.prompt()`/`session.nextUpdate()` are translated into a typed `SDKMessage` stream and pushed into an internal async queue that the public `query()` async generator reads from — this decouples the ACP session's own callback-scoped lifetime from the caller-facing async-iterable API. `canUseTool` is wired to the ACP `session/request_permission` handler (the only point in the protocol that can block a tool call). Hooks (`PreToolUse`/`PostToolUse`) tap the same message stream for observation. Custom tools run a real `@modelcontextprotocol/sdk` `McpServer` in the SDK's own process, exposed over a loopback-only, bearer-token-protected HTTP transport, and registered with the session via `SessionBuilder.withMcpServer()`.
+**Architecture:** A child process (`grok agent stdio`) is driven through `@agentclientprotocol/sdk`'s `client({name}).onRequest(...).connectWith(stream, ctx => ...)` builder. Inside that callback, `ctx.buildSession(cwd).withSession(session => ...)` drives one ACP session; `session.prompt()`/`session.nextUpdate()` are translated into a typed `SDKMessage` stream and pushed into an internal async queue that the public `query()` async generator reads from — this decouples the ACP session's own callback-scoped lifetime from the caller-facing async-iterable API. `canUseTool` is wired to the ACP `session/request_permission` handler (the only point in the protocol that can block a tool call). Hooks (`PreToolUse`/`PostToolUse`) tap the same message stream for observation. Custom tools run a real `@modelcontextprotocol/sdk` `McpServer` in the SDK's own process, exposed over a loopback-only, bearer-token-protected HTTP transport, and registered with the session via `SessionBuilder.withMcpServer()`. Both `@agentclientprotocol/sdk`'s core and `@modelcontextprotocol/sdk`'s `WebStandardStreamableHTTPServerTransport` are Web-Standard-based and runtime-agnostic by construction; the package isolates the two genuinely runtime-specific concerns — spawning the `grok` subprocess (Task 3) and hosting the loopback MCP server's HTTP listener (Task 11) — behind small, explicit seams rather than letting runtime assumptions leak into the rest of the code.
 
-**Tech Stack:** TypeScript (Node >=20, ESM), `@agentclientprotocol/sdk@^1.2.1`, `@modelcontextprotocol/sdk@^1.29.0`, `zod@^3.25.76`, `vitest@^3`, `pnpm@10.12.4`.
+**Tech Stack:** TypeScript (Node >=20, ESM; also runs on Bun, verified against Bun 1.3.14 — see Task 3), `@agentclientprotocol/sdk@^1.2.1`, `@modelcontextprotocol/sdk@^1.29.0`, `zod@^3.25.76`, `vitest@^3`, `pnpm@10.12.4`.
 
 ## Global Constraints
 
 - Repo lives at `~/Documents/Workfolder/grok-agent-sdk`, entirely separate from `grok-build` — no changes to `grok-build` source in this plan.
 - Package manager: `pnpm`. Test framework: `vitest`.
 - Every ACP method/type name used in code must be one that exists in `@agentclientprotocol/sdk@1.2.1`'s published `.d.ts` (verified during design: `ndJsonStream`, `client()`/`ClientApp`, `ClientContext.buildSession()`, `SessionBuilder`, `ActiveSession`, `ActiveSessionMessage`, `schema.*` types, `methods.client.session.requestPermission`/`.update`, `methods.agent.session.new`/`.prompt`/`.cancel`/`.fork`). Do not invent method names.
-- Loopback MCP server (Task 10) must bind to `127.0.0.1` only and require a per-run random bearer token — never an open port with no auth, per the spec's stated risk.
+- Loopback MCP server (Task 11) must bind to `127.0.0.1` only and require a per-run random bearer token — never an open port with no auth, per the spec's stated risk. It must use `WebStandardStreamableHTTPServerTransport`, not the Node-only `StreamableHTTPServerTransport`/`NodeStreamableHTTPServerTransport` wrapper, so the transport itself stays portable even though this plan only implements the `node:http` hosting bridge.
+- Runtime-portability verification status, stated honestly rather than assumed: the Node path (Task 3, Task 11) is exercised by every test in this plan. The Bun path (Task 3) was verified against a real installed Bun 1.3.14 binary during design and has its own passing unit test. The Deno path (Task 3) is written against Deno's stable, documented `Deno.Command` API but was never executed against a real Deno runtime in this environment — its test is gated on `typeof Deno !== "undefined"` and self-verifies only once actually run under `deno test`. Do not upgrade Deno support from "written" to "verified" in documentation or commit messages until that gated test has actually passed.
 - No placeholders: every task below has real, complete code. `pnpm test` must pass after every task.
 - Git: commit after each task, local repo only (no remote push in this plan).
 - Scope trim from the spec, stated explicitly rather than silently dropped: `permissionMode` ships with only `"default"`/`"bypassPermissions"` in v1 (not `"acceptEdits"`/`"plan"`), and `maxTurns` is not implemented — ACP does not expose a client-visible per-turn round counter equivalent to headless mode's `num_turns` without deeper protocol-level accounting, so it needs its own design pass rather than a guessed implementation. Both are v1.1 follow-ups; do not silently invent semantics for them in this plan.
+- Further scope trim from this turn's runtime-agnostic pass: Bun/Deno support covers only the core `query()` path (Task 3's subprocess spawn). The loopback MCP server (Task 11) still hosts exclusively via `node:http`; swapping in `Bun.serve()`/`Deno.serve()` for that listener (removing even the small Node bridge) is a natural v1.1 follow-up, not done here, since custom tools are a less central path than `query()` itself.
 
 ---
 
@@ -184,7 +186,7 @@ git commit -m "chore: scaffold grok-agent-sdk package"
 
 **Interfaces:**
 - Consumes: `ActiveSessionMessage`, `schema.SessionNotification`, `schema.PromptResponse`, `schema.StopReason` from `@agentclientprotocol/sdk`.
-- Produces: `SDKMessage` union type and `toSDKMessages(msg: ActiveSessionMessage): SDKMessage[]`, used by Task 6's `query()`.
+- Produces: `SDKMessage` union type and `toSDKMessages(msg: ActiveSessionMessage): SDKMessage[]`, used by Task 7/8's `query()`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -372,28 +374,53 @@ git commit -m "feat: translate ACP session updates into SDKMessage"
 
 ---
 
-### Task 3: Process transport
+### Task 3: Process transport (runtime-agnostic: Node, Bun, Deno)
 
 **Files:**
 - Create: `src/transport.ts`
 - Test: `test/transport.test.ts`
 
 **Interfaces:**
-- Produces: `spawnGrokAgentStdio(options: SpawnOptions): { child: ChildProcess; stream: Stream }`, consumed by Task 6's `query()`.
+- Produces:
+  ```ts
+  export interface SpawnOptions {
+    grokBin?: string;      // defaults to "grok"
+    args?: string[];       // extra args appended after "agent stdio", e.g. ["--model", "grok-build"]
+    cwd?: string;
+    env?: Record<string, string | undefined>;
+  }
+  export interface GrokAgentProcess {
+    stream: Stream;                                     // ACP-ready stdin/stdout pair
+    kill(): void;
+    readonly exited: Promise<{ code: number | null; stderrTail: string }>;
+  }
+  export function spawnGrokAgentStdio(options: SpawnOptions): GrokAgentProcess;
+  ```
+  Consumed by Task 7/8's `query()`.
+
+Spawning a subprocess has no Web Standard — Node, Bun, and Deno each have their own
+native API, so `spawnGrokAgentStdio` feature-detects the runtime (`typeof Bun`,
+`typeof Deno`, else Node) and dispatches to a runtime-specific implementation, all
+normalized to the same `GrokAgentProcess` shape. This is the *only* file in the
+package that needs this branching — everything downstream only ever touches
+`stream`/`kill()`/`exited`, all of which are plain JS, not runtime-specific types.
+
+The Node and Bun code paths below were verified directly against installed
+runtimes in this environment (Node v22.17.0, Bun 1.3.14) — notably, Bun's
+`proc.stdin` in `"pipe"` mode is a `FileSink` object (`.write()`/`.end()`), **not**
+a `WritableStream` instance, so it needs a small adapter; `proc.stdout` **is**
+already a real `ReadableStream`, no adapter needed. The Deno path is written
+against Deno's long-stable, well-documented `Deno.Command` API (`stdin`/`stdout`
+are genuine `WritableStream`/`ReadableStream` when `"piped"`), but there was no
+Deno runtime available in this environment to execute it against — Step 6 below
+adds a test gated on `typeof Deno !== "undefined"` so it self-verifies the first
+time this runs somewhere Deno is actually installed; treat that path as unverified
+until that test has actually run once.
+
+- [ ] **Step 1: Write the failing test for the Node path**
 
 ```ts
-export interface SpawnOptions {
-  grokBin?: string;      // defaults to "grok"
-  args?: string[];       // extra args appended after "agent stdio", e.g. ["--model", "grok-build"]
-  cwd?: string;
-  env?: NodeJS.ProcessEnv;
-}
-```
-
-- [ ] **Step 1: Write the failing test**
-
-```ts
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -402,7 +429,7 @@ vi.mock("node:child_process", () => ({ spawn: spawnMock }));
 
 import { spawnGrokAgentStdio } from "../src/transport.js";
 
-function fakeChild() {
+function fakeNodeChild() {
   const child = new EventEmitter() as any;
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
@@ -411,23 +438,26 @@ function fakeChild() {
   return child;
 }
 
-describe("spawnGrokAgentStdio", () => {
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("spawnGrokAgentStdio on Node", () => {
   it("spawns 'grok agent stdio' by default", () => {
-    const child = fakeChild();
+    const child = fakeNodeChild();
     spawnMock.mockReturnValue(child);
 
-    const { child: returnedChild } = spawnGrokAgentStdio({});
+    spawnGrokAgentStdio({});
 
     expect(spawnMock).toHaveBeenCalledWith(
       "grok",
       ["agent", "stdio"],
       expect.objectContaining({ stdio: ["pipe", "pipe", "pipe"] }),
     );
-    expect(returnedChild).toBe(child);
   });
 
   it("uses a custom binary and appends extra args before 'stdio'", () => {
-    const child = fakeChild();
+    const child = fakeNodeChild();
     spawnMock.mockReturnValue(child);
 
     spawnGrokAgentStdio({ grokBin: "/usr/local/bin/grok", args: ["--model", "grok-build"] });
@@ -440,13 +470,24 @@ describe("spawnGrokAgentStdio", () => {
   });
 
   it("returns a Stream with readable/writable pair", () => {
-    const child = fakeChild();
+    const child = fakeNodeChild();
     spawnMock.mockReturnValue(child);
 
     const { stream } = spawnGrokAgentStdio({});
 
     expect(stream.readable).toBeInstanceOf(ReadableStream);
     expect(stream.writable).toBeInstanceOf(WritableStream);
+  });
+
+  it("resolves exited with the exit code and buffered stderr", async () => {
+    const child = fakeNodeChild();
+    spawnMock.mockReturnValue(child);
+
+    const process = spawnGrokAgentStdio({});
+    child.stderr.write("boom\n");
+    child.emit("exit", 1);
+
+    await expect(process.exited).resolves.toEqual({ code: 1, stderrTail: "boom\n" });
   });
 });
 ```
@@ -462,7 +503,7 @@ Expected: FAIL — `Cannot find module '../src/transport.js'`.
 - [ ] **Step 3: Write the implementation**
 
 ```ts
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn as spawnNodeChild } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { ndJsonStream, type Stream } from "@agentclientprotocol/sdk";
 
@@ -470,21 +511,21 @@ export interface SpawnOptions {
   grokBin?: string;
   args?: string[];
   cwd?: string;
-  env?: NodeJS.ProcessEnv;
+  env?: Record<string, string | undefined>;
 }
 
 export interface GrokAgentProcess {
-  child: ChildProcess;
   stream: Stream;
+  kill(): void;
+  readonly exited: Promise<{ code: number | null; stderrTail: string }>;
 }
 
-export function spawnGrokAgentStdio(options: SpawnOptions): GrokAgentProcess {
-  const bin = options.grokBin ?? "grok";
-  const args = ["agent", ...(options.args ?? []), "stdio"];
+const STDERR_TAIL_LIMIT = 4000;
 
-  const child = spawn(bin, args, {
+function spawnOnNode(bin: string, args: string[], options: SpawnOptions): GrokAgentProcess {
+  const child = spawnNodeChild(bin, args, {
     cwd: options.cwd,
-    env: options.env ?? process.env,
+    env: (options.env ?? process.env) as NodeJS.ProcessEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -494,10 +535,112 @@ export function spawnGrokAgentStdio(options: SpawnOptions): GrokAgentProcess {
   const fromAgentReadable = Readable.toWeb(
     child.stdout as NodeJS.ReadableStream,
   ) as ReadableStream<Uint8Array>;
-
   const stream = ndJsonStream(toAgentWritable, fromAgentReadable);
 
-  return { child, stream };
+  let stderrTail = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrTail = (stderrTail + chunk.toString()).slice(-STDERR_TAIL_LIMIT);
+  });
+
+  const exited = new Promise<{ code: number | null; stderrTail: string }>((resolve) => {
+    child.on("exit", (code) => resolve({ code, stderrTail }));
+  });
+
+  return { stream, kill: () => child.kill(), exited };
+}
+
+async function pumpStderr(
+  readable: ReadableStream<Uint8Array>,
+  onChunk: (text: string) => void,
+): Promise<void> {
+  const reader = readable.getReader();
+  const decoder = new TextDecoder();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    onChunk(decoder.decode(value));
+  }
+}
+
+// Bun.spawn's stdout is a real ReadableStream, but stdin (in "pipe" mode) is a
+// FileSink (.write()/.end()), not a WritableStream — verified against Bun 1.3.14.
+function spawnOnBun(bin: string, args: string[], options: SpawnOptions): GrokAgentProcess {
+  const bunGlobal = (globalThis as { Bun: any }).Bun;
+  const proc = bunGlobal.spawn([bin, ...args], {
+    cwd: options.cwd,
+    env: options.env,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const toAgentWritable = new WritableStream<Uint8Array>({
+    write(chunk) {
+      proc.stdin.write(chunk);
+    },
+    close() {
+      proc.stdin.end();
+    },
+    abort() {
+      proc.stdin.end();
+    },
+  });
+  const fromAgentReadable = proc.stdout as ReadableStream<Uint8Array>;
+  const stream = ndJsonStream(toAgentWritable, fromAgentReadable);
+
+  let stderrTail = "";
+  const exited = (async () => {
+    const pump = pumpStderr(proc.stderr as ReadableStream<Uint8Array>, (text) => {
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
+    });
+    const code: number = await proc.exited;
+    await pump;
+    return { code, stderrTail };
+  })();
+
+  return { stream, kill: () => proc.kill(), exited };
+}
+
+// Deno.Command gives real WritableStream/ReadableStream for "piped" stdin/stdout —
+// unlike Bun.spawn, no adapter needed. Written against Deno's stable public API;
+// not executed against a real Deno runtime in this environment (see Step 6's test).
+function spawnOnDeno(bin: string, args: string[], options: SpawnOptions): GrokAgentProcess {
+  const denoGlobal = (globalThis as { Deno: any }).Deno;
+  const command = new denoGlobal.Command(bin, {
+    args,
+    cwd: options.cwd,
+    env: options.env,
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const child = command.spawn();
+
+  const toAgentWritable = child.stdin as WritableStream<Uint8Array>;
+  const fromAgentReadable = child.stdout as ReadableStream<Uint8Array>;
+  const stream = ndJsonStream(toAgentWritable, fromAgentReadable);
+
+  let stderrTail = "";
+  const exited = (async () => {
+    const pump = pumpStderr(child.stderr as ReadableStream<Uint8Array>, (text) => {
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
+    });
+    const status = await child.status;
+    await pump;
+    return { code: status.code as number, stderrTail };
+  })();
+
+  return { stream, kill: () => child.kill(), exited };
+}
+
+export function spawnGrokAgentStdio(options: SpawnOptions): GrokAgentProcess {
+  const bin = options.grokBin ?? "grok";
+  const args = ["agent", ...(options.args ?? []), "stdio"];
+
+  const g = globalThis as { Bun?: unknown; Deno?: unknown };
+  if (typeof g.Bun !== "undefined") return spawnOnBun(bin, args, options);
+  if (typeof g.Deno !== "undefined") return spawnOnDeno(bin, args, options);
+  return spawnOnNode(bin, args, options);
 }
 ```
 
@@ -507,13 +650,118 @@ export function spawnGrokAgentStdio(options: SpawnOptions): GrokAgentProcess {
 pnpm test -- test/transport.test.ts
 ```
 
-Expected: 3 passed.
+Expected: 4 passed (Node describe block).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add a Bun-path test using `vi.stubGlobal`**
+
+Append to `test/transport.test.ts`:
+
+```ts
+describe("spawnGrokAgentStdio on Bun", () => {
+  it("adapts Bun's FileSink stdin into a WritableStream and dispatches via Bun.spawn", async () => {
+    const written: Uint8Array[] = [];
+    let ended = false;
+    const fakeStdout = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("hello"));
+        controller.close();
+      },
+    });
+    const fakeStderr = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const bunSpawnMock = vi.fn().mockReturnValue({
+      stdin: {
+        write: (chunk: Uint8Array) => written.push(chunk),
+        end: () => {
+          ended = true;
+        },
+      },
+      stdout: fakeStdout,
+      stderr: fakeStderr,
+      exited: Promise.resolve(0),
+      kill: vi.fn(),
+    });
+    vi.stubGlobal("Bun", { spawn: bunSpawnMock });
+
+    const process = spawnGrokAgentStdio({ grokBin: "grok" });
+
+    expect(bunSpawnMock).toHaveBeenCalledWith(
+      ["grok", "agent", "stdio"],
+      expect.objectContaining({ stdin: "pipe", stdout: "pipe", stderr: "pipe" }),
+    );
+
+    const writer = process.stream.writable.getWriter();
+    await writer.write(new TextEncoder().encode("ping"));
+    await writer.close();
+    expect(written.length).toBe(1);
+    expect(ended).toBe(true);
+
+    await expect(process.exited).resolves.toEqual({ code: 0, stderrTail: "" });
+  });
+});
+```
+
+- [ ] **Step 6: Add a gated Deno-path test**
+
+Append to `test/transport.test.ts`:
+
+```ts
+describe.skipIf(typeof (globalThis as any).Deno === "undefined")(
+  "spawnGrokAgentStdio on Deno",
+  () => {
+    it("dispatches via Deno.Command and passes through its native streams", async () => {
+      const fakeStdin = new WritableStream<Uint8Array>();
+      const fakeStdout = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close();
+        },
+      });
+      const fakeStderr = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close();
+        },
+      });
+      const spawnMock = vi.fn().mockReturnValue({
+        stdin: fakeStdin,
+        stdout: fakeStdout,
+        stderr: fakeStderr,
+        status: Promise.resolve({ code: 0 }),
+        kill: vi.fn(),
+      });
+      const CommandMock = vi.fn().mockReturnValue({ spawn: spawnMock });
+      vi.stubGlobal("Deno", { Command: CommandMock });
+
+      const process = spawnGrokAgentStdio({ grokBin: "grok" });
+
+      expect(CommandMock).toHaveBeenCalledWith(
+        "grok",
+        expect.objectContaining({ args: ["agent", "stdio"], stdin: "piped" }),
+      );
+      expect(process.stream.writable).toBe(fakeStdin);
+      await expect(process.exited).resolves.toEqual({ code: 0, stderrTail: "" });
+    });
+  },
+);
+```
+
+This block is skipped everywhere except a real Deno process (`typeof Deno !== "undefined"` is only ever true when the test file itself is executed *by* Deno — running `pnpm test` under Node/Bun always skips it). If you want this path genuinely exercised, it needs to run under `deno test` with a Deno-compatible test setup, which is out of scope for this plan's `pnpm test` — treat a passing run of this block, whenever it happens, as the actual verification of `spawnOnDeno`; until then it documents intent, not confirmed behavior.
+
+- [ ] **Step 7: Run the full test file**
+
+```bash
+pnpm test -- test/transport.test.ts
+```
+
+Expected: 5 passed (4 Node + 1 Bun), 1 skipped (Deno, since this environment runs under Node/Bun via vitest, not under `deno test`).
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/transport.ts test/transport.test.ts
-git commit -m "feat: spawn grok agent stdio and wire an ACP stream"
+git commit -m "feat: spawn grok agent stdio across Node, Bun, and Deno"
 ```
 
 ---
@@ -526,7 +774,7 @@ git commit -m "feat: spawn grok agent stdio and wire an ACP stream"
 
 **Interfaces:**
 - Consumes: `schema.RequestPermissionRequest`, `schema.RequestPermissionResponse` from `@agentclientprotocol/sdk`.
-- Produces: `PermissionDecision`, `CanUseTool`, `buildPermissionHandler(canUseTool?: CanUseTool)` — a `ClientRequestHandler<RequestPermissionRequest, RequestPermissionResponse>` consumed by Task 6.
+- Produces: `PermissionDecision`, `CanUseTool`, `buildPermissionHandler(canUseTool?: CanUseTool)` — a `ClientRequestHandler<RequestPermissionRequest, RequestPermissionResponse>` consumed by Task 7/8's `query()`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -681,7 +929,7 @@ git commit -m "feat: wire canUseTool to ACP session/request_permission"
 - Test: `test/errors.test.ts`
 
 **Interfaces:**
-- Produces: `AgentProcessError`, consumed by Task 6.
+- Produces: `AgentProcessError`, consumed by Task 7/8's `query()`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -914,9 +1162,9 @@ git commit -m "feat: add internal AsyncQueue for bridging ACP callback to query(
   }
   export function query(input: { prompt: string; options?: QueryOptions }): Query;
   ```
-  This is the primary export later re-exported from `src/index.ts` (Task 12) and extended with interactive control in Task 8.
+  This is the primary export later re-exported from `src/index.ts` (Task 13) and extended with interactive control in Task 8.
 
-This task mocks `@agentclientprotocol/sdk`'s `client()` builder and `transport.ts`'s spawn function so the test suite never needs a real `grok` binary — that dependency is exercised only by the gated integration test in Task 13.
+This task mocks `@agentclientprotocol/sdk`'s `client()` builder and `transport.ts`'s spawn function so the test suite never needs a real `grok` binary — that dependency is exercised only by the gated integration test in Task 14.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -972,8 +1220,9 @@ function fakeActiveSession(updates: any[], stopResponse: any) {
 describe("query()", () => {
   it("yields translated messages for a single prompt turn", async () => {
     spawnGrokAgentStdioMock.mockReturnValue({
-      child: { stdin: {}, stdout: {}, stderr: {}, on: vi.fn(), kill: vi.fn() },
       stream: {},
+      kill: vi.fn(),
+      exited: new Promise(() => {}), // never exits during this test
     });
 
     const session = fakeActiveSession(
@@ -1044,18 +1293,17 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
     resolveSessionId = resolve;
   });
 
-  const { child, stream } = spawnGrokAgentStdio({
+  // Named agentProcess, not process — a local `process` binding would shadow
+  // Node's global `process` (used below as `process.cwd()`).
+  const agentProcess = spawnGrokAgentStdio({
     grokBin: options.grokBin,
     cwd: options.cwd,
     args: options.model ? ["--model", options.model] : undefined,
   });
 
-  let stderrTail = "";
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderrTail = (stderrTail + chunk.toString()).slice(-4000);
-  });
-  child.on("exit", (code: number | null) => {
-    if (!queue["closed" as never]) {
+  let closed = false;
+  agentProcess.exited.then(({ code, stderrTail }) => {
+    if (!closed) {
       // Process exited without the session loop observing a clean stop.
       queue.fail(new AgentProcessError(code, stderrTail));
     }
@@ -1067,7 +1315,7 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
   );
 
   app
-    .connectWith(stream, async (ctx: any) => {
+    .connectWith(agentProcess.stream, async (ctx: any) => {
       const builder = ctx.buildSession({
         cwd: options.cwd ?? process.cwd(),
         mcpServers: options.mcpServers ?? [],
@@ -1086,8 +1334,9 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
       queue.fail(error);
     })
     .finally(() => {
+      closed = true;
       queue.close();
-      child.kill();
+      agentProcess.kill();
     });
 
   return {
@@ -1134,8 +1383,9 @@ Append to `test/query.test.ts`:
 describe("query() streaming and multi-turn", () => {
   it("streams intermediate session_update messages before the final result, via nextUpdate()", async () => {
     spawnGrokAgentStdioMock.mockReturnValue({
-      child: { stdin: {}, stdout: {}, stderr: {}, on: vi.fn(), kill: vi.fn() },
       stream: {},
+      kill: vi.fn(),
+      exited: new Promise(() => {}), // never exits during this test
     });
 
     const updates = [
@@ -1167,8 +1417,9 @@ describe("query() streaming and multi-turn", () => {
 
   it("send() issues a second prompt on the same session without respawning", async () => {
     spawnGrokAgentStdioMock.mockReturnValue({
-      child: { stdin: {}, stdout: {}, stderr: {}, on: vi.fn(), kill: vi.fn() },
       stream: {},
+      kill: vi.fn(),
+      exited: new Promise(() => {}), // never exits during this test
     });
 
     const session = fakeActiveSession([], { stopReason: "end_turn" });
@@ -1204,8 +1455,9 @@ describe("query() streaming and multi-turn", () => {
 
   it("permissionMode 'bypassPermissions' ignores canUseTool and auto-allows", async () => {
     spawnGrokAgentStdioMock.mockReturnValue({
-      child: { stdin: {}, stdout: {}, stderr: {}, on: vi.fn(), kill: vi.fn() },
       stream: {},
+      kill: vi.fn(),
+      exited: new Promise(() => {}), // never exits during this test
     });
     const session = fakeActiveSession([], { stopReason: "end_turn" });
     connectWithMock.mockImplementation(async (_stream: unknown, op: any) => {
@@ -1240,8 +1492,9 @@ describe("query() streaming and multi-turn", () => {
   it("aborting the abortSignal kills the child process and ends iteration", async () => {
     const kill = vi.fn();
     spawnGrokAgentStdioMock.mockReturnValue({
-      child: { stdin: {}, stdout: {}, stderr: {}, on: vi.fn(), kill },
       stream: {},
+      kill,
+      exited: new Promise(() => {}), // never exits during this test
     });
     const session = fakeActiveSession([], { stopReason: "end_turn" });
     connectWithMock.mockImplementation(
@@ -1322,17 +1575,15 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
   let activeSession: { cancel?: () => Promise<void> } | undefined;
   let closed = false;
 
-  const { child, stream } = spawnGrokAgentStdio({
+  // Named agentProcess, not process — a local `process` binding would shadow
+  // Node's global `process` (used below as `process.cwd()`).
+  const agentProcess = spawnGrokAgentStdio({
     grokBin: options.grokBin,
     cwd: options.cwd,
     args: options.model ? ["--model", options.model] : undefined,
   });
 
-  let stderrTail = "";
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderrTail = (stderrTail + chunk.toString()).slice(-4000);
-  });
-  child.on("exit", (code: number | null) => {
+  agentProcess.exited.then(({ code, stderrTail }) => {
     if (!closed) {
       queue.fail(new AgentProcessError(code, stderrTail));
     }
@@ -1343,7 +1594,7 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
       closed = true;
       queue.close();
       void activeSession?.cancel?.();
-      child.kill();
+      agentProcess.kill();
     };
     if (options.abortSignal.aborted) onAbort();
     else options.abortSignal.addEventListener("abort", onAbort, { once: true });
@@ -1358,7 +1609,7 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
   );
 
   app
-    .connectWith(stream, async (ctx: any) => {
+    .connectWith(agentProcess.stream, async (ctx: any) => {
       const builder = ctx.buildSession({
         cwd: options.cwd ?? process.cwd(),
         mcpServers: options.mcpServers ?? [],
@@ -1394,7 +1645,7 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
     .finally(() => {
       closed = true;
       queue.close();
-      child.kill();
+      agentProcess.kill();
     });
 
   return {
@@ -1410,7 +1661,7 @@ export function query(input: { prompt: string; options?: QueryOptions }): Query 
 }
 ```
 
-Note: the `inbox` queue never calls `.close()` in this implementation — the session loop's `for await (const promptText of inbox)` runs until the outer process/session ends (driven by `child.on("exit")` failing the outbound `queue`, which the caller's `for await` loop will surface as a thrown `AgentProcessError`, ending consumption). This matches Claude Agent SDK's own interactive-mode lifecycle, where the caller ends the conversation by stopping iteration, not by an explicit "close" call from inside the loop.
+Note: the `inbox` queue never calls `.close()` in this implementation — the session loop's `for await (const promptText of inbox)` runs until the outer process/session ends (driven by `agentProcess.exited` failing the outbound `queue`, which the caller's `for await` loop will surface as a thrown `AgentProcessError`, ending consumption). This matches Claude Agent SDK's own interactive-mode lifecycle, where the caller ends the conversation by stopping iteration, not by an explicit "close" call from inside the loop.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1711,7 +1962,7 @@ git commit -m "feat: add tool() helper for defining custom SDK tools"
 
 ---
 
-### Task 11: `createSdkMcpServer` — loopback MCP server for custom tools
+### Task 11: `createSdkMcpServer` — loopback MCP server for custom tools (runtime-agnostic transport)
 
 **Files:**
 - Create: `src/mcp/sdkServer.ts`
@@ -1730,6 +1981,10 @@ git commit -m "feat: add tool() helper for defining custom SDK tools"
     tools: ToolDefinition<any>[];
   }): Promise<SdkMcpServerHandle>;
   ```
+
+Use `WebStandardStreamableHTTPServerTransport` (from `@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js`), not `StreamableHTTPServerTransport`/`NodeStreamableHTTPServerTransport`. The Web Standard variant speaks plain `Request`/`Response` and, per its own docstring, "works on any runtime that supports Web Standards: Node.js 18+, Cloudflare Workers, Deno, Bun, etc." — verified by re-inspecting the installed `@modelcontextprotocol/sdk@1.29.0` package. The Node-only wrapper exists solely for people already wired into `node:http`/Express; picking it here would undo the portability the MCP SDK's own maintainers built this transport to provide (see the SDK's history: `StdioServerTransport` broke on Deno over a `Buffer` global dependency, and the original HTTP transport broke on Workers/Deno/Bun over Express — both fixed by moving the core transport onto Web Standards in the SDK's "V2").
+
+Because we still host on `node:http` in this task (matching the rest of the package's Node-primary test environment), a small bridge function converts Node's `IncomingMessage`/`ServerResponse` to/from Web `Request`/`Response` — this bridge is the *only* Node-specific code in this file. On Bun or Deno, their native `Bun.serve()`/`Deno.serve()` already speak `Request`/`Response` directly and could call `transport.handleRequest(request)` with no bridge at all; that swap is not implemented in this task (custom tools are a less central path than the core `query()` loop this plan already made portable in Task 3), but the seam is exactly this one bridge function, same pattern as Task 3's runtime dispatch.
 
 This is the task with the highest real-network-behavior risk, so the test spins up the real server on an ephemeral loopback port and drives it with a plain `fetch` MCP `tools/call` request rather than mocking the transport — the thing worth verifying is that the token check and the tool dispatch actually work end-to-end.
 
@@ -1791,8 +2046,9 @@ Expected: FAIL — `Cannot find module '../../src/mcp/sdkServer.js'`.
 ```ts
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { Readable } from "node:stream";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import type { McpServer as AcpMcpServerConfig } from "@agentclientprotocol/sdk";
 import type { ToolDefinition } from "./tool.js";
@@ -1800,6 +2056,43 @@ import type { ToolDefinition } from "./tool.js";
 export interface SdkMcpServerHandle {
   config: AcpMcpServerConfig;
   close(): Promise<void>;
+}
+
+// The only Node-specific code in this file: converts Node's IncomingMessage into
+// the Web-standard Request that WebStandardStreamableHTTPServerTransport expects.
+// `duplex: "half"` is required by Node's fetch implementation whenever a streaming
+// body is attached to a Request.
+function nodeRequestToWebRequest(req: IncomingMessage): Request {
+  const url = `http://127.0.0.1${req.url ?? "/"}`;
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value === undefined) continue;
+    headers.set(key, Array.isArray(value) ? value.join(", ") : value);
+  }
+  const hasBody = req.method !== "GET" && req.method !== "HEAD";
+  return new Request(url, {
+    method: req.method,
+    headers,
+    body: hasBody ? (Readable.toWeb(req) as unknown as ReadableStream<Uint8Array>) : undefined,
+    duplex: hasBody ? "half" : undefined,
+  } as RequestInit);
+}
+
+// The other half of the same bridge: writes a Web-standard Response back through
+// Node's ServerResponse.
+async function writeWebResponseToNode(response: Response, res: ServerResponse): Promise<void> {
+  res.writeHead(response.status, Object.fromEntries(response.headers));
+  if (!response.body) {
+    res.end();
+    return;
+  }
+  const reader = response.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    res.write(value);
+  }
+  res.end();
 }
 
 export async function createSdkMcpServer(options: {
@@ -1817,7 +2110,10 @@ export async function createSdkMcpServer(options: {
     );
   }
 
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  // WebStandardStreamableHTTPServerTransport itself has no Node dependency — on Bun
+  // or Deno, their native serve() functions could call transport.handleRequest(request)
+  // directly with no bridge at all. Only the node:http hosting below is Node-specific.
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   await mcpServer.connect(transport);
 
   const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -1828,7 +2124,10 @@ export async function createSdkMcpServer(options: {
       );
       return;
     }
-    void transport.handleRequest(req, res);
+    const request = nodeRequestToWebRequest(req);
+    void transport
+      .handleRequest(request)
+      .then((response) => writeWebResponseToNode(response, res));
   });
 
   await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
@@ -1867,7 +2166,7 @@ Expected: 2 passed.
 
 ```bash
 git add src/mcp/sdkServer.ts test/mcp/sdkServer.test.ts
-git commit -m "feat: add createSdkMcpServer - loopback MCP server for in-process custom tools"
+git commit -m "feat: add createSdkMcpServer - loopback MCP server on a runtime-agnostic Web Standard transport"
 ```
 
 ---
@@ -1971,7 +2270,7 @@ const builder = ctx.buildSession({
 });
 ```
 
-(`session/load` restores server-side history for that session ID; the subsequent `session/new` on the same `cwd` is how this SDK's `ActiveSession` plumbing attaches update routing — matching the pattern documented in `15-agent-mode.md`'s session lifecycle. `forkSession` is exposed as a standalone function for callers who want to fork without immediately starting a `query()`, e.g. to branch a conversation for a summary — it is not wired into the default `query()` path in this task, since forking mid-query has no natural single entry point; document this as a v1.1 follow-up in the SDK's README, Task 14.)
+(`session/load` restores server-side history for that session ID; the subsequent `session/new` on the same `cwd` is how this SDK's `ActiveSession` plumbing attaches update routing — matching the pattern documented in `15-agent-mode.md`'s session lifecycle. `forkSession` is exposed as a standalone function for callers who want to fork without immediately starting a `query()`, e.g. to branch a conversation for a summary — it is not wired into the default `query()` path in this task, since forking mid-query has no natural single entry point; document this as a v1.1 follow-up in the SDK's README, Task 15.)
 
 - [ ] **Step 6: Run the full test suite to confirm no regressions**
 
